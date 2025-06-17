@@ -6,13 +6,22 @@ import datetime
 from sqlalchemy import create_engine, Column, Integer, String, Text, ForeignKey, DateTime
 from sqlalchemy.orm import sessionmaker, declarative_base, relationship, Session
 
-# SQLAlchemy setup
-DATABASE_URL = "postgresql://postgres:21112005POST@localhost:5432/postgres"
+# For ChromaDB
+import chromadb
+
+# For document text extraction
+from pypdf import PdfReader  # For PDFs
+from docx import Document as DocxDocument  # To avoid conflict with SQLAlchemy Document model
+import io  # To handle file-like objects for text extraction
+
+
+# SQLAlchemy Database Setup
+DATABASE_URL = "postgresql://postgres:21112005POST@localhost:5432/postgres" # Update with your PostgreSQL credentials
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
 
-# Models
+# Database Models
 class Knowledge(Base):
     __tablename__ = 'knowledge'
     id = Column(Integer, primary_key=True)
@@ -31,91 +40,98 @@ class Document(Base):
     uploaded_at = Column(DateTime, default=datetime.datetime.utcnow)
     knowledge = relationship("Knowledge", back_populates="documents")
 
-# Create tables (run once)
+# Create tables in PostgreSQL (run once - SQLAlchemy handles existence)
 Base.metadata.create_all(bind=engine)
 
-# Sidebar Navigation
+
+# ChromaDB Vector Database Setup
+CHROMA_PERSIST_DIR = "chroma_db" # Directory to store ChromaDB data
+chroma_client = chromadb.PersistentClient(path=CHROMA_PERSIST_DIR)
+
+# Get or create a collection for your documents in ChromaDB
+# This single line handles both getting an existing collection or creating a new one
+documents_collection = chroma_client.get_or_create_collection(name="knowledge_documents")
+
+
+# Helper Function for Text Extraction from Files
+def extract_text_from_file(file_path, filetype):
+    """
+    Extracts text content from various file types.
+    Currently supports PDF, DOCX, and plain text.
+    """
+    text = ""
+    try:
+        if filetype == "application/pdf":
+            with open(file_path, "rb") as f:
+                reader = PdfReader(f)
+                for page in reader.pages:
+                    text += page.extract_text() or "" # Add empty string if None
+        elif filetype == "application/vnd.openxmlformats-officedocument.wordprocessingml.document": # .docx
+            doc = DocxDocument(file_path)
+            for para in doc.paragraphs:
+                text += para.text + "\n"
+        elif filetype == "text/plain":
+            with open(file_path, "r", encoding="utf-8") as f:
+                text = f.read()
+        else:
+            st.warning(f"Unsupported file type for text extraction: {filetype}. Skipping text indexing in ChromaDB.")
+    except Exception as e:
+        st.error(f"Error extracting text from {file_path}: {e}")
+        text = "" # Ensure text is empty on error
+    return text
+
+
+# Initialize session state variables for upload tracking
+if 'show_knowledge_form' not in st.session_state:
+    st.session_state.show_knowledge_form = False
+if 'upload_for_id' not in st.session_state:
+    st.session_state.upload_for_id = None
+if 'pending_vectorization_doc' not in st.session_state:
+    st.session_state.pending_vectorization_doc = None # To store info of doc uploaded to Postgres, but not yet Chroma
+
+# Sidebar Navigation (as in your original code)
 with st.sidebar:
     st.title("Navigation")
-    page = st.radio("Go to", ["Knowledge", "Chat"])
+    page = st.radio("Go to", ["Knowledge", "Chat"]) # Keep Chat for now as per original request, can remove if not needed.
 
-# Main Content
-if page == "Knowledge":
-    st.title("Knowledge")
-
-    # Header with Add Button
-    col1, col2 = st.columns([8, 1])
-    with col1:
-        st.subheader("Knowledge Table")
-    with col2:
-        if st.button("+"):
-            st.session_state.show_knowledge_form = True
-
-    # Right Sidebar Form to Add Knowledge
+    # This block is for the "Add Knowledge" form
     if st.session_state.get("show_knowledge_form", False):
-        with st.sidebar:
-            st.markdown("### Add Knowledge")
-            name_input = st.text_input("Name")
-            desc_input = st.text_area("Description")
-            if st.button("Save Knowledge"):
-                db: Session = SessionLocal()
-                new_k = Knowledge(name=name_input, description=desc_input)
-                db.add(new_k)
-                db.commit()
-                db.close()
-                st.session_state.show_knowledge_form = False
-                st.rerun()
+        st.markdown("### Add Knowledge")
+        name_input = st.text_input("Name")
+        desc_input = st.text_area("Description")
+        if st.button("Save Knowledge"):
+            db: Session = SessionLocal()
+            new_k = Knowledge(name=name_input, description=desc_input)
+            db.add(new_k)
+            db.commit()
+            db.close()
+            st.session_state.show_knowledge_form = False
+            st.rerun()
 
-
-    # Fetch Knowledge Table
-    db: Session = SessionLocal()
-    knowledge_list = db.query(Knowledge).order_by(Knowledge.id.desc()).all()
-
-    # Display Table with Document Placeholder
-    for k in knowledge_list:
-        with st.expander(f"{k.name} - {k.description}"):
-            st.markdown("**Documents:**")
-
-            if k.documents:
-                doc_df = pd.DataFrame([
-                    {
-                        "File Name": doc.name,
-                        "Type": doc.filetype,
-                        "Size": doc.size,
-                        "Path": doc.path,
-                        "Uploaded At": doc.uploaded_at
-                    }
-                    for doc in k.documents
-                ])
-                st.dataframe(doc_df)
-            else:
-                st.info("No documents uploaded yet.")
-
-            if st.button(f"Upload Document to {k.name}", key=f"upload_{k.id}"):
-                st.session_state.upload_for_id = k.id
-                st.session_state.upload_for_name = k.name
-                st.session_state.upload_for_desc = k.description
-
-    db.close()
-
-    # Right Sidebar to Upload Document
+    # This block is for the "Upload to:" file uploader (for PostgreSQL)
     if st.session_state.get("upload_for_id"):
-        with st.sidebar:
-            st.markdown(f"### Upload to: {st.session_state.upload_for_name}")
-            st.markdown(f"_Description: {st.session_state.upload_for_desc}_")
-            uploaded_file = st.file_uploader("Choose a file")
-            if uploaded_file:
-                # Define storage path based on knowledge name
-                storage_dir = os.path.join("storage", st.session_state.upload_for_name)
-                os.makedirs(storage_dir, exist_ok=True)
-                file_path = os.path.join(storage_dir, uploaded_file.name)
+        st.markdown(f"### Upload to: {st.session_state.upload_for_name}")
+        st.markdown(f"_Description: {st.session_state.upload_for_desc}_")
+        uploaded_file = st.file_uploader("Choose a file")
+        if uploaded_file:
+            # Define storage path based on knowledge name
+            storage_dir = os.path.join("storage", st.session_state.upload_for_name.replace(" ", "_").lower()) # Sanitize name for path
+            os.makedirs(storage_dir, exist_ok=True)
+            file_path = os.path.join(storage_dir, uploaded_file.name)
 
-                # Save the file
+            # Save the file to local storage
+            try:
                 with open(file_path, "wb") as f:
                     f.write(uploaded_file.getbuffer())
+                st.success(f"File '{uploaded_file.name}' saved to local storage.")
+            except Exception as e:
+                st.error(f"Error saving file to disk: {e}")
+                st.session_state.upload_for_id = None # Reset state
+                st.stop() # Stop execution if file cannot be saved
 
-                # Insert into DB
-                db: Session = SessionLocal()
+            # Insert document metadata into PostgreSQL
+            db: Session = SessionLocal()
+            try:
                 new_doc = Document(
                     knowledge_id=st.session_state.upload_for_id,
                     name=uploaded_file.name,
@@ -126,9 +142,118 @@ if page == "Knowledge":
                 )
                 db.add(new_doc)
                 db.commit()
-                db.close()
 
-                st.success("File uploaded successfully.")
-                st.session_state.upload_for_id = None
-                st.rerun()
+                # Store details of the newly uploaded document for pending vectorization
+                st.session_state.pending_vectorization_doc = {
+                    "document_id": new_doc.id,
+                    "knowledge_id": st.session_state.upload_for_id,
+                    "knowledge_name": st.session_state.upload_for_name,
+                    "knowledge_description": st.session_state.upload_for_desc,
+                    "file_name": uploaded_file.name,
+                    "file_type": uploaded_file.type,
+                    "size": uploaded_file.size,
+                    "path": file_path,
+                    "uploaded_at": str(datetime.datetime.now()) # Stored as string for ChromaDB compatibility
+                }
+                st.success("Document metadata saved to PostgreSQL. Now, click 'Add to VectorDB' below.")
 
+            except Exception as e:
+                db.rollback() # Rollback changes if an error occurs during DB insert
+                st.error(f"Error saving document metadata to PostgreSQL: {e}")
+            finally:
+                db.close() # Always close the session after this DB operation
+
+            # Reset upload form state, but keep pending_vectorization_doc
+            st.session_state.upload_for_id = None
+            st.rerun() # Rerun to update the UI and show the new button
+
+
+    # --- New section for "Add to VectorDB" button in the sidebar ---
+    if st.session_state.get("pending_vectorization_doc"):
+        doc_info = st.session_state.pending_vectorization_doc
+        st.markdown("---") # Separator
+        st.markdown("### Process for VectorDB")
+        st.info(f"Ready to index: '{doc_info['file_name']}'")
+
+        if st.button("Add to VectorDB"):
+            extracted_text = extract_text_from_file(doc_info['path'], doc_info['file_type'])
+
+            if extracted_text:
+                try:
+                    documents_collection.add(
+                        documents=[extracted_text],
+                        metadatas=[{
+                            "knowledge_id": doc_info['knowledge_id'],
+                            "knowledge_name": doc_info['knowledge_name'],
+                            "knowledge_description": doc_info['knowledge_description'],
+                            "document_id": doc_info['document_id'],
+                            "file_name": doc_info['file_name'],
+                            "file_type": doc_info['file_type'],
+                            "size": doc_info['size'],
+                            "path": doc_info['path'],
+                            "uploaded_at": doc_info['uploaded_at'] # Use the string formatted datetime
+                        }],
+                        ids=[f"doc_{doc_info['document_id']}"] # Unique ID for ChromaDB
+                    )
+                    st.success(f"'{doc_info['file_name']}' successfully added to VectorDB (ChromaDB)!")
+                    st.session_state.pending_vectorization_doc = None # Clear pending state
+                    st.rerun() # Rerun to remove the button
+                except Exception as e:
+                    st.error(f"Error adding '{doc_info['file_name']}' to VectorDB: {e}")
+            else:
+                st.warning(f"Could not extract text from '{doc_info['file_name']}'. Cannot add to VectorDB.")
+
+
+# Main Content Area (as in your original code)
+if page == "Knowledge":
+    st.title("Knowledge")
+
+    # Header with Add Button (as in your original code)
+    col1, col2 = st.columns([8, 1])
+    with col1:
+        st.subheader("Knowledge Table")
+    with col2:
+        if st.button("+"):
+            st.session_state.show_knowledge_form = True
+
+    # Fetch Knowledge Table
+    # The session for fetching knowledge_list and their documents
+    db: Session = SessionLocal() # Open the session BEFORE the loop
+
+    knowledge_list = db.query(Knowledge).order_by(Knowledge.id.desc()).all()
+
+    # Display Table with Document Placeholder
+    for k in knowledge_list:
+        with st.expander(f"**{k.name}** – {k.description}"): # Changed f-string to match previous example's bolding
+            st.markdown("##### Associated Documents:") # Changed to h5 as in previous example for consistency
+
+            # This part will now work because 'k' is still bound to 'db' session
+            if k.documents:
+                doc_df = pd.DataFrame([
+                    {
+                        "File Name": doc.name,
+                        "Type": doc.filetype,
+                        "Size (bytes)": doc.size, # Consistent with previous example
+                        "Path": doc.path,
+                        "Uploaded At": doc.uploaded_at.strftime("%Y-%m-%d %H:%M:%S") # Format datetime
+                    }
+                    for doc in k.documents
+                ])
+                st.dataframe(doc_df, use_container_width=True)
+            else:
+                st.info("No documents uploaded yet.")
+
+            # Button to trigger document upload
+            if st.button(f"Upload Document to {k.name}", key=f"upload_{k.id}"):
+                st.session_state.upload_for_id = k.id
+                st.session_state.upload_for_name = k.name
+                st.session_state.upload_for_desc = k.description
+                st.session_state.pending_vectorization_doc = None # Clear any previous pending state
+                st.rerun() # Trigger a rerun to show the upload form in the sidebar
+
+    db.close() # Close the session AFTER the loop has finished accessing relationships
+
+# The "Chat" page placeholder (if you keep it)
+if page == "Chat":
+    st.title("Chat")
+    st.info("This is the Chat page.")
