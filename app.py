@@ -5,6 +5,7 @@ import os
 import datetime
 from sqlalchemy import create_engine, Column, Integer, String, Text, ForeignKey, DateTime
 from sqlalchemy.orm import sessionmaker, declarative_base, relationship, Session
+from sqlalchemy.exc import IntegrityError # For handling potential foreign key constraints
 
 # For ChromaDB
 import chromadb
@@ -89,10 +90,10 @@ if 'upload_for_id' not in st.session_state:
 if 'pending_vectorization_doc' not in st.session_state:
     st.session_state.pending_vectorization_doc = None # To store info of doc uploaded to Postgres, but not yet Chroma
 
-# Sidebar Navigation (as in your original code)
+# Sidebar Navigation
 with st.sidebar:
     st.title("Navigation")
-    page = st.radio("Go to", ["Knowledge", "Chat"]) # Keep Chat for now as per original request, can remove if not needed.
+    page = st.radio("Go to", ["Knowledge", "Chat"])
 
     # This block is for the "Add Knowledge" form
     if st.session_state.get("show_knowledge_form", False):
@@ -204,11 +205,11 @@ with st.sidebar:
                 st.warning(f"Could not extract text from '{doc_info['file_name']}'. Cannot add to VectorDB.")
 
 
-# Main Content Area (as in your original code)
+# Main Content Area
 if page == "Knowledge":
     st.title("Knowledge")
 
-    # Header with Add Button (as in your original code)
+    # Header with Add Button
     col1, col2 = st.columns([8, 1])
     with col1:
         st.subheader("Knowledge Table")
@@ -217,34 +218,85 @@ if page == "Knowledge":
             st.session_state.show_knowledge_form = True
 
     # Fetch Knowledge Table
-    # The session for fetching knowledge_list and their documents
     db: Session = SessionLocal() # Open the session BEFORE the loop
-
     knowledge_list = db.query(Knowledge).order_by(Knowledge.id.desc()).all()
 
-    # Display Table with Document Placeholder
-    for k in knowledge_list:
-        with st.expander(f"**{k.name}** – {k.description}"): # Changed f-string to match previous example's bolding
-            st.markdown("##### Associated Documents:") # Changed to h5 as in previous example for consistency
+    # Display Knowledge Bases in Expanders with their Documents
+    if not knowledge_list:
+        st.info("No Knowledge Bases created yet. Click 'Add New' to get started!")
 
-            # This part will now work because 'k' is still bound to 'db' session
+    for k in knowledge_list:
+        with st.expander(f"**{k.name}** – {k.description}"):
+            st.markdown("##### Associated Documents:")
+
             if k.documents:
-                doc_df = pd.DataFrame([
-                    {
+                doc_data = []
+                for doc in k.documents:
+                    doc_data.append({
+                        "id": doc.id, # Keep ID for selection
                         "File Name": doc.name,
                         "Type": doc.filetype,
-                        "Size (bytes)": doc.size, # Consistent with previous example
+                        "Size (bytes)": doc.size,
                         "Path": doc.path,
-                        "Uploaded At": doc.uploaded_at.strftime("%Y-%m-%d %H:%M:%S") # Format datetime
-                    }
-                    for doc in k.documents
-                ])
-                st.dataframe(doc_df, use_container_width=True)
+                        "Uploaded At": doc.uploaded_at.strftime("%Y-%m-%d %H:%M:%S")
+                    })
+                doc_df = pd.DataFrame(doc_data)
+                st.dataframe(doc_df[['File Name', 'Type', 'Size (bytes)', 'Uploaded At']], use_container_width=True)
+
+                # --- Document Removal Section ---
+                st.markdown("---")
+                st.markdown("##### Remove Document:")
+                document_options = {f"{d.name} (ID: {d.id})": d.id for d in k.documents}
+                selected_doc_key = st.selectbox(
+                    f"Select document to remove from **{k.name}**:",
+                    options=list(document_options.keys()),
+                    key=f"remove_select_{k.id}" # Unique key for each selectbox
+                )
+
+                if selected_doc_key:
+                    doc_to_remove_id = document_options[selected_doc_key]
+                    if st.button(f"Remove Selected Document", key=f"remove_btn_{k.id}"):
+                        doc_to_remove = db.query(Document).filter_by(id=doc_to_remove_id).first()
+
+                        if doc_to_remove:
+                            # 1. Delete from ChromaDB
+                            try:
+                                chroma_doc_id = f"doc_{doc_to_remove.id}"
+                                documents_collection.delete(ids=[chroma_doc_id])
+                                st.success(f"Document '{doc_to_remove.name}' removed from VectorDB (ChromaDB).")
+                            except Exception as e:
+                                st.warning(f"Could not remove '{doc_to_remove.name}' from VectorDB (ChromaDB). It might not have been indexed or an error occurred: {e}")
+
+                            # 2. Delete file from local storage
+                            if os.path.exists(doc_to_remove.path):
+                                try:
+                                    os.remove(doc_to_remove.path)
+                                    st.success(f"File '{doc_to_remove.name}' deleted from local storage.")
+                                except Exception as e:
+                                    st.error(f"Error deleting file '{doc_to_remove.name}' from storage: {e}")
+                            else:
+                                st.info(f"File '{doc_to_remove.name}' not found in local storage path: {doc_to_remove.path}")
+
+
+                            # 3. Delete from PostgreSQL
+                            try:
+                                db.delete(doc_to_remove)
+                                db.commit()
+                                st.success(f"Document '{doc_to_remove.name}' removed from PostgreSQL.")
+                                st.rerun() # Rerun to update the displayed list
+                            except IntegrityError as e:
+                                db.rollback()
+                                st.error(f"Integrity Error: Could not delete document from PostgreSQL. {e}")
+                            except Exception as e:
+                                db.rollback()
+                                st.error(f"Error deleting document from PostgreSQL: {e}")
+                        else:
+                            st.error("Document not found in database.")
             else:
                 st.info("No documents uploaded yet.")
 
             # Button to trigger document upload
-            if st.button(f"Upload Document to {k.name}", key=f"upload_{k.id}"):
+            if st.button(f"Upload Document to **{k.name}**", key=f"upload_{k.id}"):
                 st.session_state.upload_for_id = k.id
                 st.session_state.upload_for_name = k.name
                 st.session_state.upload_for_desc = k.description
